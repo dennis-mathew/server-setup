@@ -26,8 +26,10 @@ done
 
 echo "=================== PHASE 2: UFW & SSH ====================" | tee -a "$LOG"
 sudo ufw status | grep -q "Status: active" && log "UFW is active" || fail "UFW is not active"
-sudo grep -q "^PermitRootLogin no" /etc/ssh/sshd_config && log "SSH root login disabled" || fail "SSH root login still enabled"
-sudo grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config && log "SSH password login disabled" || fail "SSH password login still enabled"
+# sshd -T prints the settings sshd actually uses, including drop-in files.
+SSHD_CONFIG=$(sudo sshd -T)
+grep -qx "permitrootlogin no" <<<"$SSHD_CONFIG" && log "SSH root login disabled" || fail "SSH root login still enabled"
+grep -qx "passwordauthentication no" <<<"$SSHD_CONFIG" && log "SSH password login disabled" || fail "SSH password login still enabled"
 
 echo "=================== PHASE 3: FAIL2BAN ====================" | tee -a "$LOG"
 sudo systemctl is-active --quiet fail2ban && log "Fail2Ban is running" || fail "Fail2Ban is not running"
@@ -44,19 +46,19 @@ sudo grep -q "rkhunter" /etc/crontab && log "rkhunter cronjob found" || fail "rk
 sudo grep -q "chkrootkit" /etc/crontab && log "chkrootkit cronjob found" || fail "chkrootkit cronjob not found"
 
 echo "=================== PHASE 5: MODSECURITY ====================" | tee -a "$LOG"
-if sudo nginx -V 2>&1 | grep -q "modsecurity"; then
-  log "ModSecurity module is compiled"
-else
-  sudo test -f /etc/nginx/modules-enabled/ngx_http_modsecurity_module.so && log "ModSecurity module loaded dynamically" || fail "ModSecurity module not found"
-fi
-sudo grep -q "SecRuleEngine On" /etc/nginx/modsecurity.conf && log "ModSecurity config is active" || fail "SecRuleEngine is not set to On"
+sudo test -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so && log "ModSecurity module installed" || fail "ModSecurity module not found"
+sudo grep -qs "ngx_http_modsecurity_module.so" /etc/nginx/modules-enabled/*.conf && log "ModSecurity module loaded" || fail "ModSecurity module not loaded"
+sudo grep -q "^SecRuleEngine On" /etc/nginx/modsecurity.conf && log "ModSecurity config is active" || fail "SecRuleEngine is not set to On"
+NGINX_CONFIG=$(sudo nginx -T 2>/dev/null || true)
+grep -q "modsecurity on;" <<<"$NGINX_CONFIG" && log "ModSecurity enabled in nginx" || fail "modsecurity on; not set in nginx config"
 
 echo "=================== PHASE 6: OWASP CRS ====================" | tee -a "$LOG"
 sudo test -d /etc/nginx/owasp-crs && log "OWASP CRS folder exists" || fail "OWASP CRS not installed"
 sudo grep -q "owasp-crs/crs-setup.conf" /etc/nginx/modsecurity.conf && log "CRS config included in modsecurity.conf" || fail "CRS config missing"
 
 echo "=================== PHASE 7: LOGROTATE & AUTO-UPGRADES ====================" | tee -a "$LOG"
-sudo test -f /etc/logrotate.d/nginx && log "Logrotate config for Nginx exists" || fail "Missing nginx logrotate config"
+sudo grep -q "rotate 30" /etc/logrotate.d/nginx && log "Nginx logs kept for 30 days" || fail "Nginx logrotate not set to 30 days"
+sudo grep -q "postrotate" /etc/logrotate.d/nginx && log "Nginx reopens logs after rotation" || fail "Nginx logrotate is missing postrotate"
 sudo test -f /etc/apt/apt.conf.d/20auto-upgrades && log "Unattended-upgrades config found" || fail "Unattended-upgrades config missing"
 
 echo "=================== FINAL CHECK ====================" | tee -a "$LOG"

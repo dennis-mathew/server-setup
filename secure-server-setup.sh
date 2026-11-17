@@ -16,11 +16,22 @@ log_step() {
 }
 
 mark_done() {
-  echo "$1" > "$PHASE_MARKER"
+  echo "$1" >> "$PHASE_MARKER"
 }
 
 already_done() {
-  [[ -f "$PHASE_MARKER" && $(cat "$PHASE_MARKER") == "$1" ]]
+  [[ -f "$PHASE_MARKER" ]] && grep -qx "$1" "$PHASE_MARKER"
+}
+
+# Resume this script after a reboot; removed again when setup finishes.
+RESUME_CMD="@reboot $WORKDIR/secure-server-setup.sh"
+
+enable_resume() {
+  (crontab -l 2>/dev/null | grep -vxF "$RESUME_CMD" || true; echo "$RESUME_CMD") | crontab -
+}
+
+disable_resume() {
+  (crontab -l 2>/dev/null | grep -vxF "$RESUME_CMD" || true) | crontab -
 }
 
 ####################
@@ -43,7 +54,9 @@ if ! already_done "phase1"; then
   sudo timedatectl set-timezone Asia/Kolkata
 
   mark_done "phase1"
+  enable_resume
   sudo reboot
+  exit 0
 fi
 
 ##############################################
@@ -71,8 +84,17 @@ if ! already_done "phase3"; then
   sudo ufw allow https
   sudo ufw --force enable
 
-  sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-  sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  # Refuse to disable password login unless this user can log in with a key.
+  if [[ ! -s "$HOME/.ssh/authorized_keys" ]]; then
+    log_step "PHASE 3" "No SSH key in $HOME/.ssh/authorized_keys; add one before disabling password login"
+    exit 1
+  fi
+
+  # A drop-in, because sshd uses the first value it reads and cloud images
+  # often ship 50-cloud-init.conf with PasswordAuthentication yes.
+  printf 'PermitRootLogin no\nPasswordAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/00-hardening.conf >/dev/null
+  sudo sshd -t
+  sudo systemctl restart ssh
 
   cat <<EOF | sudo tee /etc/fail2ban/jail.local >/dev/null
 [sshd]
@@ -113,11 +135,11 @@ if ! already_done "phase4"; then
   sudo rkhunter --propupd || true
   sudo chkrootkit || true
 
-  sudo bash -c 'cat <<EOF >> /etc/crontab
-0 2 * * * root clamscan -r / --bell -i >> /var/log/clamav/scan.log
+  sudo tee -a /etc/crontab >/dev/null <<'EOF'
+0 2 * * * root clamscan -r -i --exclude-dir='^/(proc|sys|dev|run)' / >> /var/log/clamav/scan.log 2>&1
 0 3 * * * root rkhunter --check --skip-keypress
 0 4 * * * root chkrootkit
-EOF'
+EOF
 
   mark_done "phase4"
 fi
@@ -127,7 +149,9 @@ fi
 #################################
 
 if ! already_done "phase5"; then
-  log_step "PHASE 5" "Cloning and building ModSecurity and Nginx 1.24.0"
+  # The dynamic module must be built against the installed nginx version.
+  NGINX_VERSION=$(nginx -v 2>&1 | sed -E 's|.*nginx/([0-9.]+).*|\1|')
+  log_step "PHASE 5" "Cloning and building ModSecurity and the connector for nginx $NGINX_VERSION"
 
   cd /opt
   sudo git clone https://github.com/owasp-modsecurity/ModSecurity.git
@@ -137,17 +161,17 @@ if ! already_done "phase5"; then
 
   cd /opt
   sudo git clone https://github.com/owasp-modsecurity/ModSecurity-nginx.git
-  sudo wget https://nginx.org/download/nginx-1.24.0.tar.gz
-  sudo tar -xzf nginx-1.24.0.tar.gz
-  cd nginx-1.24.0
+  sudo wget "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
+  sudo tar -xzf "nginx-$NGINX_VERSION.tar.gz"
+  cd "nginx-$NGINX_VERSION"
   sudo ./configure --with-compat --add-dynamic-module=/opt/ModSecurity-nginx
-  sudo make && sudo make modules
-  sudo cp objs/ngx_http_modsecurity_module.so /etc/nginx/modules-enabled/
+  sudo make modules
+  sudo cp objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/
+  echo 'load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' | sudo tee /etc/nginx/modules-enabled/50-mod-http-modsecurity.conf >/dev/null
 
   sudo cp /opt/ModSecurity/modsecurity.conf-recommended /etc/nginx/modsecurity.conf
   sudo cp /opt/ModSecurity/unicode.mapping /etc/nginx/unicode.mapping
 
-  sudo sed -i '6iload_module /etc/nginx/modules-enabled/ngx_http_modsecurity_module.so;' /etc/nginx/nginx.conf
   sudo sed -i 's/^SecRuleEngine .*/SecRuleEngine On/' /etc/nginx/modsecurity.conf
 
   mark_done "phase5"
@@ -165,6 +189,9 @@ if ! already_done "phase6"; then
 
   echo -e "\nInclude owasp-crs/crs-setup.conf\nInclude owasp-crs/rules/*.conf" | sudo tee -a /etc/nginx/modsecurity.conf
 
+  # Turn ModSecurity on for every server block (http context).
+  printf 'modsecurity on;\nmodsecurity_rules_file /etc/nginx/modsecurity.conf;\n' | sudo tee /etc/nginx/conf.d/modsecurity.conf >/dev/null
+
   sudo nginx -t
   sudo systemctl restart nginx
 
@@ -178,7 +205,8 @@ fi
 if ! already_done "phase7"; then
   log_step "PHASE 7" "Configuring logrotate and unattended upgrades"
 
-  echo -e "/var/log/nginx/*.log {\n  rotate 30\n  daily\n  missingok\n  notifempty\n  compress\n}" | sudo tee /etc/logrotate.d/nginx
+  # Keep Ubuntu's config (its postrotate makes nginx reopen logs); only keep 30 days.
+  sudo sed -i 's/^\(\s*\)rotate [0-9]*/\1rotate 30/' /etc/logrotate.d/nginx
 
   sudo dpkg-reconfigure -f noninteractive unattended-upgrades
 
@@ -190,6 +218,7 @@ fi
 ##########################
 
 if ! already_done "phase8"; then
+  disable_resume
   log_step "PHASE 8" "Secure server setup completed successfully"
   mark_done "phase8"
 fi
