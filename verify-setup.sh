@@ -46,7 +46,8 @@ sudo grep -q "rkhunter" /etc/crontab && log "rkhunter cronjob found" || fail "rk
 sudo grep -q "chkrootkit" /etc/crontab && log "chkrootkit cronjob found" || fail "chkrootkit cronjob not found"
 
 echo "=================== PHASE 5: MODSECURITY ====================" | tee -a "$LOG"
-sudo test -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so && log "ModSecurity module installed" || fail "ModSecurity module not found"
+MODULES_PATH=$(nginx -V 2>&1 | grep -oP -- '--modules-path=\K\S+')
+sudo test -f "$MODULES_PATH/ngx_http_modsecurity_module.so" && log "ModSecurity module installed" || fail "ModSecurity module not found"
 sudo grep -qs "ngx_http_modsecurity_module.so" /etc/nginx/modules-enabled/*.conf && log "ModSecurity module loaded" || fail "ModSecurity module not loaded"
 sudo grep -q "^SecRuleEngine On" /etc/nginx/modsecurity.conf && log "ModSecurity config is active" || fail "SecRuleEngine is not set to On"
 NGINX_CONFIG=$(sudo nginx -T 2>/dev/null || true)

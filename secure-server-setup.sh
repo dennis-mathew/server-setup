@@ -8,6 +8,11 @@ LOGFILE="$WORKDIR/setup.log"
 PHASE_MARKER="$WORKDIR/.phase"
 SCREEN_NAME="secure-setup"
 
+# Pinned releases, so a rebuild gets the same code. Bump deliberately.
+MODSECURITY_VERSION="v3.0.17"
+MODSECURITY_NGINX_VERSION="v1.0.4"
+CRS_VERSION="v4.30.0"
+
 mkdir -p "$WORKDIR"
 touch "$LOGFILE"
 
@@ -50,7 +55,8 @@ fi
 
 if ! already_done "phase1"; then
   log_step "PHASE 1" "System update and timezone config"
-  sudo apt update && sudo apt upgrade -y
+  sudo apt update
+  sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y
   sudo timedatectl set-timezone Asia/Kolkata
 
   mark_done "phase1"
@@ -65,7 +71,10 @@ fi
 
 if ! already_done "phase2"; then
   log_step "PHASE 2" "Installing base packages"
-  sudo apt install -y nginx ufw fail2ban rkhunter chkrootkit clamav clamav-daemon logrotate unattended-upgrades git build-essential libpcre3 libpcre3-dev libssl-dev zlib1g-dev certbot python3-certbot-nginx gcc make autoconf automake libtool libcurl4-openssl-dev liblua5.3-dev libfuzzy-dev ssdeep gettext pkg-config libgeoip-dev libyajl-dev doxygen libpcre2-dev zlib1g wget libsystemd-dev libevent-dev curl
+  # rkhunter and chkrootkit pull in postfix, which stops to ask about mail.
+  # Answer "No configuration" up front and keep apt non-interactive.
+  echo "postfix postfix/main_mailer_type select No configuration" | sudo debconf-set-selections
+  sudo DEBIAN_FRONTEND=noninteractive apt install -y nginx ufw fail2ban rkhunter chkrootkit clamav clamav-daemon logrotate unattended-upgrades git build-essential libssl-dev zlib1g-dev certbot python3-certbot-nginx gcc make autoconf automake libtool libcurl4-openssl-dev liblua5.3-dev libfuzzy-dev ssdeep gettext pkg-config libgeoip-dev libyajl-dev doxygen libpcre2-dev zlib1g wget libsystemd-dev libevent-dev curl
 
   mark_done "phase2"
 fi
@@ -154,20 +163,28 @@ if ! already_done "phase5"; then
   log_step "PHASE 5" "Cloning and building ModSecurity and the connector for nginx $NGINX_VERSION"
 
   cd /opt
-  sudo git clone https://github.com/owasp-modsecurity/ModSecurity.git
-  cd ModSecurity && sudo git submodule init && sudo git submodule update
+  sudo git clone --depth 1 --branch "$MODSECURITY_VERSION" https://github.com/owasp-modsecurity/ModSecurity.git
+  cd ModSecurity
+  # Recursive: Mbed TLS 4.x has nested submodules of its own.
+  sudo git submodule update --init --recursive
   sudo ./build.sh
-  sudo ./configure && sudo make && sudo make install
+  # One command per line: set -e does not stop on a failure inside an && chain.
+  sudo ./configure
+  sudo make -j"$(nproc)"
+  sudo make install
 
   cd /opt
-  sudo git clone https://github.com/owasp-modsecurity/ModSecurity-nginx.git
+  sudo git clone --depth 1 --branch "$MODSECURITY_NGINX_VERSION" https://github.com/owasp-modsecurity/ModSecurity-nginx.git
   sudo wget "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
   sudo tar -xzf "nginx-$NGINX_VERSION.tar.gz"
   cd "nginx-$NGINX_VERSION"
   sudo ./configure --with-compat --add-dynamic-module=/opt/ModSecurity-nginx
-  sudo make modules
-  sudo cp objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/
-  echo 'load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' | sudo tee /etc/nginx/modules-enabled/50-mod-http-modsecurity.conf >/dev/null
+  sudo make -j"$(nproc)" modules
+  # The modules directory only exists once a dynamic module is installed.
+  MODULES_PATH=$(nginx -V 2>&1 | grep -oP -- '--modules-path=\K\S+')
+  sudo mkdir -p "$MODULES_PATH"
+  sudo cp objs/ngx_http_modsecurity_module.so "$MODULES_PATH/"
+  echo "load_module $MODULES_PATH/ngx_http_modsecurity_module.so;" | sudo tee /etc/nginx/modules-enabled/50-mod-http-modsecurity.conf >/dev/null
 
   sudo cp /opt/ModSecurity/modsecurity.conf-recommended /etc/nginx/modsecurity.conf
   sudo cp /opt/ModSecurity/unicode.mapping /etc/nginx/unicode.mapping
@@ -184,7 +201,7 @@ fi
 if ! already_done "phase6"; then
   log_step "PHASE 6" "Installing OWASP CRS and linking config"
 
-  sudo git clone https://github.com/coreruleset/coreruleset.git /etc/nginx/owasp-crs
+  sudo git clone --depth 1 --branch "$CRS_VERSION" https://github.com/coreruleset/coreruleset.git /etc/nginx/owasp-crs
   sudo cp /etc/nginx/owasp-crs/crs-setup.conf.example /etc/nginx/owasp-crs/crs-setup.conf
 
   echo -e "\nInclude owasp-crs/crs-setup.conf\nInclude owasp-crs/rules/*.conf" | sudo tee -a /etc/nginx/modsecurity.conf
